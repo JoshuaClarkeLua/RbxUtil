@@ -177,6 +177,8 @@ local Trove = require(script.Parent.Trove)
 local IS_SERVER = RunService:IsServer()
 local DEFAULT_ANCESTORS = { workspace, game:GetService("Players") }
 local DEFAULT_TIMEOUT = 60
+local CANCELLED_PROMISE = Promise.new(function() end)
+CANCELLED_PROMISE:cancel()
 
 -- Symbol keys:
 local KEY_ANCESTORS = Symbol("Ancestors")
@@ -189,6 +191,7 @@ local KEY_ACTIVE_EXTENSIONS = Symbol("ActiveExtensions")
 local KEY_STARTING = Symbol("Starting")
 local KEY_STARTED = Symbol("Started")
 
+local OnConstructInstance
 local renderId = 0
 local function NextRenderName(): string
 	renderId += 1
@@ -230,6 +233,182 @@ local function GetActiveExtensions(component, extensionList)
 		end
 	end
 	return if allActive then extensionList else activeExtensions
+end
+
+local function StartComponent(self, component)
+	component[KEY_STARTING] = coroutine.running()
+
+	InvokeExtensionFn(component, "Starting")
+
+	component:Start()
+	if component[KEY_STARTING] == nil then
+		-- Component's Start method stopped the component
+		return
+	end
+
+	InvokeExtensionFn(component, "Started")
+
+	local hasHeartbeatUpdate = typeof(component.HeartbeatUpdate) == "function"
+	local hasSteppedUpdate = typeof(component.SteppedUpdate) == "function"
+	local hasRenderSteppedUpdate = typeof(component.RenderSteppedUpdate) == "function"
+
+	if hasHeartbeatUpdate then
+		component._heartbeatUpdate = RunService.Heartbeat:Connect(function(dt)
+			component:HeartbeatUpdate(dt)
+		end)
+	end
+
+	if hasSteppedUpdate then
+		component._steppedUpdate = RunService.Stepped:Connect(function(_, dt)
+			component:SteppedUpdate(dt)
+		end)
+	end
+
+	if hasRenderSteppedUpdate and not IS_SERVER then
+		if component.RenderPriority then
+			component._renderName = NextRenderName()
+			RunService:BindToRenderStep(component._renderName, component.RenderPriority, function(dt)
+				component:RenderSteppedUpdate(dt)
+			end)
+		else
+			component._renderSteppedUpdate = RunService.RenderStepped:Connect(function(dt)
+				component:RenderSteppedUpdate(dt)
+			end)
+		end
+	end
+
+	component[KEY_STARTED] = true
+	component[KEY_STARTING] = nil
+
+	self.Started:Fire(component)
+end
+
+local function StopComponent(self, component)
+	if component[KEY_STARTING] then
+		-- Stop the component during its start method invocation:
+		local startThread = component[KEY_STARTING]
+		if coroutine.status(startThread) ~= "normal" then
+			pcall(function()
+				task.cancel(startThread)
+			end)
+		else
+			task.defer(function()
+				pcall(function()
+					task.cancel(startThread)
+				end)
+			end)
+		end
+		component[KEY_STARTING] = nil
+	end
+
+	if component._heartbeatUpdate then
+		component._heartbeatUpdate:Disconnect()
+	end
+
+	if component._steppedUpdate then
+		component._steppedUpdate:Disconnect()
+	end
+
+	if component._renderSteppedUpdate then
+		component._renderSteppedUpdate:Disconnect()
+	elseif component._renderName then
+		RunService:UnbindFromRenderStep(component._renderName)
+	end
+
+	InvokeExtensionFn(component, "Stopping")
+	component:Stop()
+	InvokeExtensionFn(component, "Stopped")
+	self.Stopped:Fire(component)
+end
+
+local function SafeConstruct(self, instance, id)
+	if self[KEY_LOCK_CONSTRUCT][instance] ~= id then
+		return nil
+	end
+	local component = self:_instantiate(instance)
+	if self[KEY_LOCK_CONSTRUCT][instance] ~= id then
+		return nil
+	end
+	return component
+end
+
+local function TryConstructComponent(self, instance)
+	if self[KEY_INST_TO_COMPONENTS][instance] then
+		return
+	end
+	local id = self[KEY_LOCK_CONSTRUCT][instance] or 0
+	id += 1
+	self[KEY_LOCK_CONSTRUCT][instance] = id
+	task.defer(function()
+		local component = SafeConstruct(self, instance, id)
+		if not component then
+			return
+		end
+		self[KEY_INST_TO_COMPONENTS][instance] = component
+		table.insert(self[KEY_COMPONENTS], component)
+		task.defer(function()
+			if self[KEY_INST_TO_COMPONENTS][instance] == component then
+				StartComponent(self, component)
+			end
+		end)
+	end)
+end
+
+local function TryDeconstructComponent(self, instance)
+	local component = self[KEY_INST_TO_COMPONENTS][instance]
+	if not component then
+		return
+	end
+	self[KEY_INST_TO_COMPONENTS][instance] = nil
+	self[KEY_LOCK_CONSTRUCT][instance] = nil
+	local components = self[KEY_COMPONENTS]
+	local index = table.find(components, component)
+	if index then
+		local n = #components
+		components[index] = components[n]
+		components[n] = nil
+	end
+	if component[KEY_STARTED] or component[KEY_STARTING] then
+		task.spawn(StopComponent, self, component)
+	end
+end
+
+local function StartWatchingInstance(self, instance)
+	if self.watchingInstances[instance] then
+		return
+	end
+	local function IsInAncestorList(): boolean
+		for _, parent in ipairs(self[KEY_ANCESTORS]) do
+			if instance:IsDescendantOf(parent) then
+				return true
+			end
+		end
+		return false
+	end
+	local ancestryChangedHandle = self[KEY_TROVE]:Connect(instance.AncestryChanged, function(_, parent)
+		if parent and IsInAncestorList() then
+			TryConstructComponent(self, instance)
+		else
+			TryDeconstructComponent(self, instance)
+		end
+	end)
+	self.watchingInstances[instance] = ancestryChangedHandle
+	if IsInAncestorList() then
+		TryConstructComponent(self, instance)
+	end
+end
+
+local function InstanceTagged(self, instance: Instance)
+	StartWatchingInstance(self, instance)
+end
+
+local function InstanceUntagged(self, instance: Instance)
+	local watchHandle = self.watchingInstances[instance]
+	if watchHandle then
+		self.watchingInstances[instance] = nil
+		self[KEY_TROVE]:Remove(watchHandle)
+	end
+	TryDeconstructComponent(self, instance)
 end
 
 --[=[
@@ -333,190 +512,18 @@ function Component:_instantiate(instance: Instance)
 end
 
 function Component:_setup()
-	local watchingInstances = {}
+	self.watchingInstances = {}
 
-	local function StartComponent(component)
-		component[KEY_STARTING] = coroutine.running()
-
-		InvokeExtensionFn(component, "Starting")
-
-		component:Start()
-		if component[KEY_STARTING] == nil then
-			-- Component's Start method stopped the component
-			return
-		end
-
-		InvokeExtensionFn(component, "Started")
-
-		local hasHeartbeatUpdate = typeof(component.HeartbeatUpdate) == "function"
-		local hasSteppedUpdate = typeof(component.SteppedUpdate) == "function"
-		local hasRenderSteppedUpdate = typeof(component.RenderSteppedUpdate) == "function"
-
-		if hasHeartbeatUpdate then
-			component._heartbeatUpdate = RunService.Heartbeat:Connect(function(dt)
-				component:HeartbeatUpdate(dt)
-			end)
-		end
-
-		if hasSteppedUpdate then
-			component._steppedUpdate = RunService.Stepped:Connect(function(_, dt)
-				component:SteppedUpdate(dt)
-			end)
-		end
-
-		if hasRenderSteppedUpdate and not IS_SERVER then
-			if component.RenderPriority then
-				component._renderName = NextRenderName()
-				RunService:BindToRenderStep(component._renderName, component.RenderPriority, function(dt)
-					component:RenderSteppedUpdate(dt)
-				end)
-			else
-				component._renderSteppedUpdate = RunService.RenderStepped:Connect(function(dt)
-					component:RenderSteppedUpdate(dt)
-				end)
-			end
-		end
-
-		component[KEY_STARTED] = true
-		component[KEY_STARTING] = nil
-
-		self.Started:Fire(component)
-	end
-
-	local function StopComponent(component)
-		if component[KEY_STARTING] then
-			-- Stop the component during its start method invocation:
-			local startThread = component[KEY_STARTING]
-			if coroutine.status(startThread) ~= "normal" then
-				pcall(function()
-					task.cancel(startThread)
-				end)
-			else
-				task.defer(function()
-					pcall(function()
-						task.cancel(startThread)
-					end)
-				end)
-			end
-			component[KEY_STARTING] = nil
-		end
-
-		if component._heartbeatUpdate then
-			component._heartbeatUpdate:Disconnect()
-		end
-
-		if component._steppedUpdate then
-			component._steppedUpdate:Disconnect()
-		end
-
-		if component._renderSteppedUpdate then
-			component._renderSteppedUpdate:Disconnect()
-		elseif component._renderName then
-			RunService:UnbindFromRenderStep(component._renderName)
-		end
-
-		InvokeExtensionFn(component, "Stopping")
-		component:Stop()
-		InvokeExtensionFn(component, "Stopped")
-		self.Stopped:Fire(component)
-	end
-
-	local function SafeConstruct(instance, id)
-		if self[KEY_LOCK_CONSTRUCT][instance] ~= id then
-			return nil
-		end
-		local component = self:_instantiate(instance)
-		if self[KEY_LOCK_CONSTRUCT][instance] ~= id then
-			return nil
-		end
-		return component
-	end
-
-	local function TryConstructComponent(instance)
-		if self[KEY_INST_TO_COMPONENTS][instance] then
-			return
-		end
-		local id = self[KEY_LOCK_CONSTRUCT][instance] or 0
-		id += 1
-		self[KEY_LOCK_CONSTRUCT][instance] = id
-		task.defer(function()
-			local component = SafeConstruct(instance, id)
-			if not component then
-				return
-			end
-			self[KEY_INST_TO_COMPONENTS][instance] = component
-			table.insert(self[KEY_COMPONENTS], component)
-			task.defer(function()
-				if self[KEY_INST_TO_COMPONENTS][instance] == component then
-					StartComponent(component)
-				end
-			end)
-		end)
-	end
-
-	local function TryDeconstructComponent(instance)
-		local component = self[KEY_INST_TO_COMPONENTS][instance]
-		if not component then
-			return
-		end
-		self[KEY_INST_TO_COMPONENTS][instance] = nil
-		self[KEY_LOCK_CONSTRUCT][instance] = nil
-		local components = self[KEY_COMPONENTS]
-		local index = table.find(components, component)
-		if index then
-			local n = #components
-			components[index] = components[n]
-			components[n] = nil
-		end
-		if component[KEY_STARTED] or component[KEY_STARTING] then
-			task.spawn(StopComponent, component)
-		end
-	end
-
-	local function StartWatchingInstance(instance)
-		if watchingInstances[instance] then
-			return
-		end
-		local function IsInAncestorList(): boolean
-			for _, parent in ipairs(self[KEY_ANCESTORS]) do
-				if instance:IsDescendantOf(parent) then
-					return true
-				end
-			end
-			return false
-		end
-		local ancestryChangedHandle = self[KEY_TROVE]:Connect(instance.AncestryChanged, function(_, parent)
-			if parent and IsInAncestorList() then
-				TryConstructComponent(instance)
-			else
-				TryDeconstructComponent(instance)
-			end
-		end)
-		watchingInstances[instance] = ancestryChangedHandle
-		if IsInAncestorList() then
-			TryConstructComponent(instance)
-		end
-	end
-
-	local function InstanceTagged(instance: Instance)
-		StartWatchingInstance(instance)
-	end
-
-	local function InstanceUntagged(instance: Instance)
-		local watchHandle = watchingInstances[instance]
-		if watchHandle then
-			watchingInstances[instance] = nil
-			self[KEY_TROVE]:Remove(watchHandle)
-		end
-		TryDeconstructComponent(instance)
-	end
-
-	self[KEY_TROVE]:Connect(CollectionService:GetInstanceAddedSignal(self.Tag), InstanceTagged)
-	self[KEY_TROVE]:Connect(CollectionService:GetInstanceRemovedSignal(self.Tag), InstanceUntagged)
+	self[KEY_TROVE]:Connect(CollectionService:GetInstanceAddedSignal(self.Tag), function(instance: Instance)
+		InstanceTagged(self, instance)
+	end)
+	self[KEY_TROVE]:Connect(CollectionService:GetInstanceRemovedSignal(self.Tag), function(instance: Instance)
+		InstanceUntagged(self, instance)
+	end)
 
 	local tagged = CollectionService:GetTagged(self.Tag)
 	for _, instance in ipairs(tagged) do
-		task.defer(InstanceTagged, instance)
+		task.defer(InstanceTagged, self, instance)
 	end
 end
 
@@ -669,6 +676,18 @@ function Component:Stop() end
 ]=]
 function Component:GetComponent(componentClass)
 	return componentClass[KEY_INST_TO_COMPONENTS][self.Instance]
+end
+
+function Component:TryConstruct(instance: Instance)
+	if not CollectionService:HasTag(instance, self.Tag) then
+		return CANCELLED_PROMISE
+	end
+	local comp = self:FromInstance(instance)
+	if comp then
+		return comp
+	end
+	InstanceTagged(self, instance)
+	return self:WaitForInstance(instance)
 end
 
 --[=[
