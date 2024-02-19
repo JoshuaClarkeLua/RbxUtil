@@ -431,11 +431,11 @@ Component.__index = function(t,k)
 		return v
 	end
 	if RunService:IsServer() then
-		if typeof(t.Server) == 'table' and typeof(t.Server[k]) == 'function' then
+		if typeof(rawget(t, "Server")) == 'table' and typeof(rawget(t.Server, k)) == 'function' then
 			return t.Server[k]
 		end
 	else
-		if typeof(t.Client) == 'table' and typeof(t.Client[k]) == 'function' then
+		if typeof(rawget(t, "Client")) == 'table' and typeof(rawget(t.Client, k)) == 'function' then
 			return t.Client[k]
 		end
 	end
