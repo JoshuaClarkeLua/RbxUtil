@@ -790,4 +790,6 @@ function Component:Destroy()
 	self[KEY_TROVE]:Destroy()
 end
 
+export type Component = typeof(Component.new(...))
+export type ComponentInstance = typeof(setmetatable({ Instance = Instance.new(...) }, Component.new(...)))
 return Component
