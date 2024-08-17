@@ -1,8 +1,8 @@
 [package]
-name = "sleitnick/trove"
+name = "joshuaclarkelua/trove"
 description = "Trove class for tracking and cleaning up objects"
-version = "1.1.0"
+version = "1.4.2"
 license = "MIT"
-authors = ["Stephen Leitnick"]
+authors = ["Stephen Leitnick", "Joshua Clarke"]
 registry = "https://github.com/UpliftGames/wally-index"
 realm = "shared"
